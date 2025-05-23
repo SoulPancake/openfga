@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/openfga/openfga/pkg/storage/mongo"
 	"html/template"
 	"net"
 	"net/http"
@@ -421,6 +422,7 @@ func (s *ServerContext) datastoreConfig(config *serverconfig.Config) (storage.Op
 	}
 
 	dsCfg := sqlcommon.NewConfig(datastoreOptions...)
+	//mongoCfg := mongo.NewConfig(dsCfg)
 
 	var datastore storage.OpenFGADatastore
 	var err error
@@ -447,6 +449,11 @@ func (s *ServerContext) datastoreConfig(config *serverconfig.Config) (storage.Op
 		datastore, err = sqlite.New(config.Datastore.URI, dsCfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("initialize sqlite datastore: %w", err)
+		}
+	case "mongo":
+		datastore, err = mongo.New(config.Datastore.URI, dsCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initialize mongo datastore: %w", err)
 		}
 	default:
 		return nil, nil, fmt.Errorf("storage engine '%s' is unsupported", config.Datastore.Engine)
