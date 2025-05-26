@@ -548,13 +548,35 @@ func (d *Datastore) ReadChanges(ctx context.Context, store string, filter storag
 }
 
 func (d *Datastore) IsReady(ctx context.Context) (storage.ReadinessStatus, error) {
-	//TODO implement me
-	panic("implement me")
+	ctx, span := startTrace(ctx, "IsReady")
+	defer span.End()
+
+	// Try to ping the database with a timeout
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err := d.client.Ping(pingCtx, readpref.Primary())
+	if err != nil {
+		return storage.ReadinessStatus{IsReady: false}, fmt.Errorf("mongodb ping failed: %w", err)
+	}
+
+	// Database connection is ready
+	return storage.ReadinessStatus{IsReady: true}, nil
 }
 
 func (d *Datastore) Close() {
-	//TODO implement me
-	panic("implement me")
+	if d.client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := d.client.Disconnect(ctx); err != nil {
+			d.logger.Error("error closing MongoDB connection")
+		}
+		
+		if d.dbStatsCollector != nil {
+			prometheus.Unregister(d.dbStatsCollector)
+		}
+	}
 }
 
 func (d *Datastore) WriteAssertions(ctx context.Context, store, modelID string, assertions []*openfgav1.Assertion) error {
