@@ -50,6 +50,8 @@ func RunDatastoreTestContainer(t testing.TB, engine string) DatastoreTestContain
 		return memoryTestContainer{}
 	case "sqlite":
 		return NewSqliteTestContainer().RunSqliteTestDatabase(t)
+	case "mongo":
+		return NewMongoTestContainer().RunMongoTestDatabase(t)
 	default:
 		t.Fatalf("unsupported datastore engine: %q", engine)
 		return nil

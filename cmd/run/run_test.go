@@ -801,6 +801,9 @@ func TestServerMetricsReporting(t *testing.T) {
 	t.Run("sqlite", func(t *testing.T) {
 		testServerMetricsReporting(t, "sqlite")
 	})
+	t.Run("mongodb", func(t *testing.T) {
+		testServerMetricsReporting(t, "mongo")
+	})
 }
 
 func testServerMetricsReporting(t *testing.T, engine string) {

@@ -3,6 +3,7 @@
 package util
 
 import (
+	"github.com/openfga/openfga/pkg/storage/mongo"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,6 +67,8 @@ func MustBootstrapDatastore(t testing.TB, engine string) (storagefixtures.Datast
 		ds, err = mysql.New(uri, sqlcommon.NewConfig())
 	case "sqlite":
 		ds, err = sqlite.New(uri, sqlcommon.NewConfig())
+	case "mongo":
+		ds, err = mongo.New(uri, sqlcommon.NewConfig())
 	default:
 		t.Fatalf("unsupported datastore engine: %q", engine)
 	}
