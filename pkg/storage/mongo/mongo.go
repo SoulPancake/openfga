@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/openfga/openfga/pkg/storage"
 	"go.mongodb.org/mongo-driver/bson"
@@ -23,6 +24,14 @@ import (
 	"time"
 )
 
+const (
+	TuplesCollection = "tuples"
+)
+
+func startTrace(ctx context.Context, name string) (context.Context, trace.Span) {
+	return tracer.Start(ctx, "mongo."+name)
+}
+
 // mongoTupleIterator implements storage.TupleIterator for MongoDB
 type mongoTupleIterator struct {
 	ctx       context.Context
@@ -33,10 +42,11 @@ type mongoTupleIterator struct {
 
 var tracer = otel.Tracer("openfga/pkg/storage/mysql")
 
-// Datastore provides a MongoDB based implementation of [storage.OpenFGADatastore].
+// Datastore provides a MongoDB-based implementation of [storage.OpenFGADatastore].
 type Datastore struct {
 	database               *mongo.Database
 	client                 *mongo.Client
+	tuplesCollection       *mongo.Collection
 	stbl                   sq.StatementBuilderType
 	db                     *sql.DB
 	dbInfo                 *sqlcommon.DBInfo
@@ -47,12 +57,91 @@ type Datastore struct {
 }
 
 func (d *Datastore) Write(ctx context.Context, store string, deletes storage.Deletes, wr storage.Writes) error {
-	//TODO implement me
-	panic("implement me")
-}
+	ctx, span := startTrace(ctx, "Write")
+	defer span.End()
 
-func startTrace(ctx context.Context, name string) (context.Context, trace.Span) {
-	return tracer.Start(ctx, "mongo."+name)
+	coll := d.tuplesCollection
+
+	// Start a session and a transaction
+	session, err := d.client.StartSession()
+	if err != nil {
+		return fmt.Errorf("failed to start mongo session: %w", err)
+	}
+	defer session.EndSession(ctx)
+
+	// Use WithTransaction to handle commit/abort logic
+	err = mongo.WithSession(ctx, session, func(sessionContext mongo.SessionContext) error {
+		if err := session.StartTransaction(); err != nil {
+			return fmt.Errorf("failed to start transaction: %w", err)
+		}
+
+		// Process deletions
+		if len(deletes) > 0 {
+			var deleteFilters []bson.M
+			for _, tk := range deletes {
+				filter := bson.M{
+					"store": store,
+				}
+
+				if tk.GetObject() != "" {
+					filter["object"] = tk.GetObject()
+				}
+
+				if tk.GetRelation() != "" {
+					filter["relation"] = tk.GetRelation()
+				}
+
+				if tk.GetUser() != "" {
+					filter["user"] = tk.GetUser()
+				}
+
+				deleteFilters = append(deleteFilters, filter)
+			}
+
+			if len(deleteFilters) > 0 {
+				// Use OR to combine filters
+				deleteOp := bson.M{"$or": deleteFilters}
+				_, err := coll.DeleteMany(sessionContext, deleteOp)
+				if err != nil {
+					return fmt.Errorf("failed to delete tuples: %w", err)
+				}
+			}
+		}
+
+		// Process insertions
+		if len(wr) > 0 {
+			var documents []interface{}
+			for _, tupleKey := range wr {
+				if tupleKey == nil {
+					continue
+				}
+
+				doc := bson.M{
+					"store":    store,
+					"object":   tupleKey.GetObject(),
+					"relation": tupleKey.GetRelation(),
+					"user":     tupleKey.GetUser(),
+				}
+
+				documents = append(documents, doc)
+			}
+
+			if len(documents) > 0 {
+				_, err := coll.InsertMany(sessionContext, documents)
+				if err != nil {
+					return fmt.Errorf("failed to insert tuples: %w", err)
+				}
+			}
+		}
+
+		return session.CommitTransaction(sessionContext)
+	})
+
+	if err != nil {
+		return fmt.Errorf("transaction failed: %w", err)
+	}
+
+	return nil
 }
 
 func (d *Datastore) Read(
@@ -80,7 +169,7 @@ func (d *Datastore) Read(
 	}
 
 	// Execute the query
-	coll := d.database.Collection("tuples")
+	coll := d.tuplesCollection
 	cursor, err := coll.Find(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("error querying tuples: %w", err)
@@ -190,7 +279,7 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 	findOptions.SetSort(bson.M{"_id": 1})
 
 	// Execute the query
-	coll := d.database.Collection("tuples")
+	coll := d.tuplesCollection
 	cursor, err := coll.Find(ctx, filter, &findOptions)
 	if err != nil {
 		return nil, "", fmt.Errorf("error querying tuples: %w", err)
@@ -240,18 +329,167 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 }
 
 func (d *Datastore) ReadUserTuple(ctx context.Context, store string, tupleKey *openfgav1.TupleKey, options storage.ReadUserTupleOptions) (*openfgav1.Tuple, error) {
-	//TODO implement me
-	panic("implement me")
+	ctx, span := startTrace(ctx, "ReadUserTuple")
+	defer span.End()
+
+	if tupleKey == nil {
+		return nil, fmt.Errorf("tuple key cannot be nil")
+	}
+
+	// Build the filter for exact match on the tuple key
+	filter := bson.M{
+		"store":    store,
+		"object":   tupleKey.GetObject(),
+		"relation": tupleKey.GetRelation(),
+		"user":     tupleKey.GetUser(),
+	}
+
+	// Execute the query
+	coll := d.tuplesCollection
+	var result struct {
+		Object   string `bson:"object"`
+		Relation string `bson:"relation"`
+		User     string `bson:"user"`
+	}
+
+	err := coll.FindOne(ctx, filter).Decode(&result)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("error querying tuple: %w", err)
+	}
+
+	// Convert the result to a tuple
+	tuple := &openfgav1.Tuple{
+		Key: &openfgav1.TupleKey{
+			Object:   result.Object,
+			Relation: result.Relation,
+			User:     result.User,
+		},
+	}
+
+	return tuple, nil
 }
 
-func (d *Datastore) ReadUsersetTuples(ctx context.Context, store string, filter storage.ReadUsersetTuplesFilter, options storage.ReadUsersetTuplesOptions) (storage.TupleIterator, error) {
-	//TODO implement me
-	panic("implement me")
+func (d *Datastore) ReadUsersetTuples(
+	ctx context.Context,
+	store string,
+	filter storage.ReadUsersetTuplesFilter,
+	_ storage.ReadUsersetTuplesOptions,
+) (storage.TupleIterator, error) {
+	ctx, span := startTrace(ctx, "ReadUsersetTuples")
+	defer span.End()
+
+	// Build the filter for querying usersets
+	mongoFilter := bson.M{"store": store}
+
+	// Filter by object and relation if provided
+	if filter.Object != "" {
+		mongoFilter["object"] = filter.Object
+	}
+	if filter.Relation != "" {
+		mongoFilter["relation"] = filter.Relation
+	}
+
+	// Filter by allowed user type restrictions
+	if len(filter.AllowedUserTypeRestrictions) > 0 {
+		userPatterns := []bson.M{}
+
+		for _, userset := range filter.AllowedUserTypeRestrictions {
+			if _, ok := userset.GetRelationOrWildcard().(*openfgav1.RelationReference_Relation); ok {
+				// Pattern for type:*#relation
+				userPatterns = append(userPatterns, bson.M{
+					"user": bson.M{
+						"$regex": userset.GetType() + ":%#" + userset.GetRelation(),
+					},
+				})
+			}
+			if _, ok := userset.GetRelationOrWildcard().(*openfgav1.RelationReference_Wildcard); ok {
+				// Pattern for type:*
+				userPatterns = append(userPatterns, bson.M{
+					"user": userset.GetType() + ":*",
+				})
+			}
+		}
+
+		if len(userPatterns) > 0 {
+			mongoFilter["$or"] = userPatterns
+		}
+	}
+
+	// Execute the query
+	coll := d.tuplesCollection
+	cursor, err := coll.Find(ctx, mongoFilter)
+	if err != nil {
+		return nil, fmt.Errorf("error querying userset tuples: %w", err)
+	}
+
+	return newMongoTupleIterator(ctx, cursor), nil
 }
 
-func (d *Datastore) ReadStartingWithUser(ctx context.Context, store string, filter storage.ReadStartingWithUserFilter, options storage.ReadStartingWithUserOptions) (storage.TupleIterator, error) {
-	//TODO implement me
-	panic("implement me")
+func (d *Datastore) ReadStartingWithUser(
+	ctx context.Context,
+	store string,
+	filter storage.ReadStartingWithUserFilter,
+	opts storage.ReadStartingWithUserOptions,
+) (storage.TupleIterator, error) {
+	ctx, span := startTrace(ctx, "ReadStartingWithUser")
+	defer span.End()
+
+	// Build the filter for querying tuples starting with user
+	mongoFilter := bson.M{
+		"store": store,
+	}
+
+	// Process user filters similar to the MySQL implementation
+	if len(filter.UserFilter) > 0 {
+		var userFilters []bson.M
+
+		for _, u := range filter.UserFilter {
+			targetUser := u.GetObject()
+			if u.GetRelation() != "" {
+				targetUser = u.GetObject() + "#" + u.GetRelation()
+			}
+			userFilters = append(userFilters, bson.M{"user": targetUser})
+		}
+
+		if len(userFilters) > 0 {
+			mongoFilter["$or"] = userFilters
+		}
+	}
+	// TODO: @SoulPancake check this once
+	//else if filter.User != "" { // Handle the original User field for backward compatibility
+	//	mongoFilter["user"] = filter.User
+	//}
+
+	// Add object type and relation filters
+	if filter.ObjectType != "" {
+		// Match on object_type field or use regex on object field depending on schema
+		mongoFilter["object_type"] = filter.ObjectType
+	}
+
+	if filter.Relation != "" {
+		mongoFilter["relation"] = filter.Relation
+	}
+
+	// Handle ObjectIDs filter if provided
+	if filter.ObjectIDs != nil && filter.ObjectIDs.Size() > 0 {
+		mongoFilter["object_id"] = bson.M{"$in": filter.ObjectIDs.Values()}
+	}
+
+	// Execute the query with sorting similar to MySQL implementation
+	findOptions := options.FindOptions{}
+	findOptions.SetSort(bson.M{"object_id": 1})
+
+	// Execute the query
+	coll := d.tuplesCollection
+	cursor, err := coll.Find(ctx, mongoFilter, &findOptions)
+	if err != nil {
+		return nil, fmt.Errorf("error querying tuples starting with user: %w", err)
+	}
+
+	return newMongoTupleIterator(ctx, cursor), nil
 }
 
 func (d *Datastore) MaxTuplesPerWrite() int {
@@ -359,9 +597,11 @@ func New(uri string, cfg *sqlcommon.Config) (*Datastore, error) {
 		}
 	}
 
+	tuplesCollection := database.Collection(TuplesCollection)
 	return &Datastore{
 		client:                 client,
 		database:               database,
+		tuplesCollection:       tuplesCollection,
 		logger:                 cfg.Logger,
 		dbStatsCollector:       collector,
 		maxTuplesPerWriteField: cfg.MaxTuplesPerWriteField,
