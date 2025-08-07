@@ -113,6 +113,18 @@ func (d *Datastore) Write(ctx context.Context, store string, deletes storage.Del
 				"user":     tupleKey.GetUser(),
 			}
 
+			// Handle conditions
+			if tupleKey.GetCondition() != nil {
+				conditionName, conditionContext, err := sqlcommon.MarshalRelationshipCondition(tupleKey.GetCondition())
+				if err != nil {
+					return fmt.Errorf("failed to marshal condition: %w", err)
+				}
+				doc["condition_name"] = conditionName
+				if conditionContext != nil {
+					doc["condition_context"] = conditionContext
+				}
+			}
+
 			documents = append(documents, doc)
 		}
 
@@ -172,9 +184,11 @@ func newMongoTupleIterator(ctx context.Context, cursor *mongo.Cursor) storage.Tu
 func (it *mongoTupleIterator) Next(ctx context.Context) (*openfgav1.Tuple, error) {
 	if it.cursor.Next(ctx) {
 		var doc struct {
-			Object   string `bson:"object"`
-			Relation string `bson:"relation"`
-			User     string `bson:"user"`
+			Object           string `bson:"object"`
+			Relation         string `bson:"relation"`
+			User             string `bson:"user"`
+			ConditionName    string `bson:"condition_name,omitempty"`
+			ConditionContext []byte `bson:"condition_context,omitempty"`
 		}
 
 		if err := it.cursor.Decode(&doc); err != nil {
@@ -187,6 +201,26 @@ func (it *mongoTupleIterator) Next(ctx context.Context) (*openfgav1.Tuple, error
 				Relation: doc.Relation,
 				User:     doc.User,
 			},
+		}
+
+		// Handle conditions
+		if doc.ConditionName != "" {
+			condition := &openfgav1.RelationshipCondition{
+				Name: doc.ConditionName,
+			}
+
+			if doc.ConditionContext != nil {
+				var conditionContextStruct structpb.Struct
+				if err := proto.Unmarshal(doc.ConditionContext, &conditionContextStruct); err != nil {
+					return nil, fmt.Errorf("error unmarshalling condition context: %w", err)
+				}
+				condition.Context = &conditionContextStruct
+			} else {
+				// Set empty context if none provided
+				condition.Context = &structpb.Struct{}
+			}
+
+			tuple.Key.Condition = condition
 		}
 
 		it.lastTuple = tuple
@@ -246,6 +280,9 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 	if opts.Pagination.PageSize > 0 {
 		findOptions.SetLimit(int64(opts.Pagination.PageSize + 1)) // +1 to check if there are more results
+	} else {
+		// If no page size specified, return all results
+		// Don't set a limit
 	}
 
 	if opts.Pagination.From != "" {
@@ -269,10 +306,12 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 	for cursor.Next(ctx) {
 		var doc struct {
-			ID       string `bson:"_id"`
-			Object   string `bson:"object"`
-			Relation string `bson:"relation"`
-			User     string `bson:"user"`
+			ID               string `bson:"_id"`
+			Object           string `bson:"object"`
+			Relation         string `bson:"relation"`
+			User             string `bson:"user"`
+			ConditionName    string `bson:"condition_name,omitempty"`
+			ConditionContext []byte `bson:"condition_context,omitempty"`
 		}
 
 		if err := cursor.Decode(&doc); err != nil {
@@ -281,13 +320,35 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 		lastID = doc.ID
 
-		tuples = append(tuples, &openfgav1.Tuple{
+		tuple := &openfgav1.Tuple{
 			Key: &openfgav1.TupleKey{
 				Object:   doc.Object,
 				Relation: doc.Relation,
 				User:     doc.User,
 			},
-		})
+		}
+
+		// Handle conditions
+		if doc.ConditionName != "" {
+			condition := &openfgav1.RelationshipCondition{
+				Name: doc.ConditionName,
+			}
+
+			if doc.ConditionContext != nil {
+				var conditionContextStruct structpb.Struct
+				if err := proto.Unmarshal(doc.ConditionContext, &conditionContextStruct); err != nil {
+					return nil, "", fmt.Errorf("error unmarshalling condition context: %w", err)
+				}
+				condition.Context = &conditionContextStruct
+			} else {
+				// Set empty context if none provided
+				condition.Context = &structpb.Struct{}
+			}
+
+			tuple.Key.Condition = condition
+		}
+
+		tuples = append(tuples, tuple)
 	}
 
 	if err := cursor.Err(); err != nil {
@@ -323,9 +384,11 @@ func (d *Datastore) ReadUserTuple(ctx context.Context, store string, tupleKey *o
 	// Execute the query
 	coll := d.tuplesCollection
 	var result struct {
-		Object   string `bson:"object"`
-		Relation string `bson:"relation"`
-		User     string `bson:"user"`
+		Object           string `bson:"object"`
+		Relation         string `bson:"relation"`
+		User             string `bson:"user"`
+		ConditionName    string `bson:"condition_name,omitempty"`
+		ConditionContext []byte `bson:"condition_context,omitempty"`
 	}
 
 	err := coll.FindOne(ctx, filter).Decode(&result)
@@ -343,6 +406,26 @@ func (d *Datastore) ReadUserTuple(ctx context.Context, store string, tupleKey *o
 			Relation: result.Relation,
 			User:     result.User,
 		},
+	}
+
+	// Handle conditions
+	if result.ConditionName != "" {
+		condition := &openfgav1.RelationshipCondition{
+			Name: result.ConditionName,
+		}
+
+		if result.ConditionContext != nil {
+			var conditionContextStruct structpb.Struct
+			if err := proto.Unmarshal(result.ConditionContext, &conditionContextStruct); err != nil {
+				return nil, fmt.Errorf("error unmarshalling condition context: %w", err)
+			}
+			condition.Context = &conditionContextStruct
+		} else {
+			// Set empty context if none provided
+			condition.Context = &structpb.Struct{}
+		}
+
+		tuple.Key.Condition = condition
 	}
 
 	return tuple, nil
