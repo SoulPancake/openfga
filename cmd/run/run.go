@@ -68,6 +68,7 @@ import (
 	"github.com/openfga/openfga/pkg/server/health"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/storage/memory"
+	"github.com/openfga/openfga/pkg/storage/mongo"
 	"github.com/openfga/openfga/pkg/storage/mysql"
 	"github.com/openfga/openfga/pkg/storage/postgres"
 	"github.com/openfga/openfga/pkg/storage/sqlcommon"
@@ -456,6 +457,34 @@ func (s *ServerContext) datastoreConfig(config *serverconfig.Config) (storage.Op
 		datastore, err = sqlite.New(config.Datastore.URI, dsCfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("initialize sqlite datastore: %w", err)
+		}
+	case "mongo", "mongodb":
+		// MongoDB requires its own configuration type
+		mongoCfg := &mongo.Config{
+			URI:                    config.Datastore.URI,
+			Database:               "openfga", // default database name
+			Username:               config.Datastore.Username,
+			Password:               config.Datastore.Password,
+			Logger:                 s.Logger,
+			MaxTuplesPerWriteField: config.MaxTuplesPerWrite,
+			MaxTypesPerModelField:  config.MaxTypesPerAuthorizationModel,
+			MaxOpenConns:           config.Datastore.MaxOpenConns,
+			ConnMaxIdleTime:        config.Datastore.ConnMaxIdleTime,
+			ConnMaxLifetime:        config.Datastore.ConnMaxLifetime,
+			ExportMetrics:          config.Datastore.Metrics.Enabled,
+		}
+		
+		// Extract database name from URI if present
+		if strings.Contains(config.Datastore.URI, "/") {
+			parts := strings.Split(config.Datastore.URI, "/")
+			if len(parts) > 1 && parts[len(parts)-1] != "" {
+				mongoCfg.Database = strings.Split(parts[len(parts)-1], "?")[0] // Remove query params
+			}
+		}
+		
+		datastore, err = mongo.New(config.Datastore.URI, mongoCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initialize mongodb datastore: %w", err)
 		}
 	default:
 		return nil, nil, fmt.Errorf("storage engine '%s' is unsupported", config.Datastore.Engine)
