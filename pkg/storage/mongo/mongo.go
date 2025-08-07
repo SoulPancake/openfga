@@ -65,83 +65,63 @@ func (d *Datastore) Write(ctx context.Context, store string, deletes storage.Del
 
 	coll := d.tuplesCollection
 
-	// Start a session and a transaction
-	session, err := d.client.StartSession()
-	if err != nil {
-		return fmt.Errorf("failed to start mongo session: %w", err)
+	// Process deletions first
+	if len(deletes) > 0 {
+		var deleteFilters []bson.M
+		for _, tk := range deletes {
+			filter := bson.M{
+				"store": store,
+			}
+
+			if tk.GetObject() != "" {
+				filter["object"] = tk.GetObject()
+			}
+
+			if tk.GetRelation() != "" {
+				filter["relation"] = tk.GetRelation()
+			}
+
+			if tk.GetUser() != "" {
+				filter["user"] = tk.GetUser()
+			}
+
+			deleteFilters = append(deleteFilters, filter)
+		}
+
+		if len(deleteFilters) > 0 {
+			// Use OR to combine filters
+			deleteOp := bson.M{"$or": deleteFilters}
+			_, err := coll.DeleteMany(ctx, deleteOp)
+			if err != nil {
+				return fmt.Errorf("failed to delete tuples: %w", err)
+			}
+		}
 	}
-	defer session.EndSession(ctx)
 
-	// Use WithTransaction to handle commit/abort logic
-	err = mongo.WithSession(ctx, session, func(sessionContext mongo.SessionContext) error {
-		if err := session.StartTransaction(); err != nil {
-			return fmt.Errorf("failed to start transaction: %w", err)
+	// Process insertions
+	if len(wr) > 0 {
+		var documents []interface{}
+		for _, tupleKey := range wr {
+			if tupleKey == nil {
+				continue
+			}
+
+			doc := bson.M{
+				"store":    store,
+				"object":   tupleKey.GetObject(),
+				"relation": tupleKey.GetRelation(),
+				"user":     tupleKey.GetUser(),
+			}
+
+			documents = append(documents, doc)
 		}
 
-		// Process deletions
-		if len(deletes) > 0 {
-			var deleteFilters []bson.M
-			for _, tk := range deletes {
-				filter := bson.M{
-					"store": store,
-				}
-
-				if tk.GetObject() != "" {
-					filter["object"] = tk.GetObject()
-				}
-
-				if tk.GetRelation() != "" {
-					filter["relation"] = tk.GetRelation()
-				}
-
-				if tk.GetUser() != "" {
-					filter["user"] = tk.GetUser()
-				}
-
-				deleteFilters = append(deleteFilters, filter)
-			}
-
-			if len(deleteFilters) > 0 {
-				// Use OR to combine filters
-				deleteOp := bson.M{"$or": deleteFilters}
-				_, err := coll.DeleteMany(sessionContext, deleteOp)
-				if err != nil {
-					return fmt.Errorf("failed to delete tuples: %w", err)
-				}
+		if len(documents) > 0 {
+			_, err := coll.InsertMany(ctx, documents)
+			if err != nil {
+				return fmt.Errorf("failed to insert tuples: %w", err)
 			}
 		}
-
-		// Process insertions
-		if len(wr) > 0 {
-			var documents []interface{}
-			for _, tupleKey := range wr {
-				if tupleKey == nil {
-					continue
-				}
-
-				doc := bson.M{
-					"store":    store,
-					"object":   tupleKey.GetObject(),
-					"relation": tupleKey.GetRelation(),
-					"user":     tupleKey.GetUser(),
-				}
-
-				documents = append(documents, doc)
-			}
-
-			if len(documents) > 0 {
-				_, err := coll.InsertMany(sessionContext, documents)
-				if err != nil {
-					return fmt.Errorf("failed to insert tuples: %w", err)
-				}
-			}
-		}
-
-		return session.CommitTransaction(sessionContext)
-	})
-
-	if err != nil {
-		return fmt.Errorf("transaction failed: %w", err)
 	}
 
 	return nil
@@ -518,6 +498,11 @@ func (d *Datastore) ReadAuthorizationModel(ctx context.Context, store string, id
 		return nil, fmt.Errorf("error querying authorization model: %w", err)
 	}
 
+	// If model has zero types, return ErrNotFound
+	if len(result.TypeDefs) == 0 {
+		return nil, storage.ErrNotFound
+	}
+
 	return &openfgav1.AuthorizationModel{
 		Id:              result.ID,
 		TypeDefinitions: result.TypeDefs,
@@ -619,6 +604,12 @@ func (d *Datastore) MaxTypesPerAuthorizationModel() int {
 func (d *Datastore) WriteAuthorizationModel(ctx context.Context, store string, model *openfgav1.AuthorizationModel) error {
 	ctx, span := startTrace(ctx, "WriteAuthorizationModel")
 	defer span.End()
+
+	typeDefinitions := model.GetTypeDefinitions()
+
+	if len(typeDefinitions) < 1 {
+		return nil
+	}
 
 	coll := d.database.Collection("authorization_models")
 
