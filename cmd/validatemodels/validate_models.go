@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/openfga/openfga/pkg/logger"
 	"github.com/openfga/openfga/pkg/storage"
+	"github.com/openfga/openfga/pkg/storage/mongo"
 	"github.com/openfga/openfga/pkg/storage/mysql"
 	"github.com/openfga/openfga/pkg/storage/postgres"
 	"github.com/openfga/openfga/pkg/storage/sqlcommon"
@@ -67,6 +70,25 @@ func runValidate(_ *cobra.Command, _ []string) error {
 		db, err = postgres.New(uri, cfg)
 	case "sqlite":
 		db, err = sqlite.New(uri, cfg)
+	case "mongo", "mongodb":
+		// MongoDB requires its own configuration type
+		mongoCfg := &mongo.Config{
+			URI:                    uri,
+			Database:               "openfga", // default database name
+			Logger:                 logger.NewNoopLogger(),
+			MaxTuplesPerWriteField: 100,
+			MaxTypesPerModelField:  100,
+		}
+		
+		// Extract database name from URI if present
+		if strings.Contains(uri, "/") {
+			parts := strings.Split(uri, "/")
+			if len(parts) > 1 && parts[len(parts)-1] != "" {
+				mongoCfg.Database = strings.Split(parts[len(parts)-1], "?")[0] // Remove query params
+			}
+		}
+		
+		db, err = mongo.New(uri, mongoCfg)
 	case "":
 		return fmt.Errorf("missing datastore engine type")
 	case "memory":
