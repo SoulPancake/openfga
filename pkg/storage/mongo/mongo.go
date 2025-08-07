@@ -740,6 +740,15 @@ func (d *Datastore) CreateStore(ctx context.Context, store *openfgav1.Store) (*o
 		return nil, fmt.Errorf("error checking store existence: %w", err)
 	}
 
+	// Check if store with same ID already exists
+	existingIDFilter := bson.M{"id": store.GetId()}
+	err = coll.FindOne(ctx, existingIDFilter).Decode(&existingStore)
+	if err == nil {
+		return nil, storage.ErrCollision
+	} else if !errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, fmt.Errorf("error checking store ID existence: %w", err)
+	}
+
 	// Prepare store document
 	now := time.Now().UTC()
 	storeDoc := bson.M{
