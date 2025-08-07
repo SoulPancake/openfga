@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ import (
 // Connection pool tests for MySQL datastore to ensure that the following environment variables
 // and their corresponding configurations work as expected:
 // - OPENFGA_DATASTORE_MAX_OPEN_CONNS (MaxOpenConns)
-// - OPENFGA_DATASTORE_MAX_IDLE_CONNS (MaxIdleConns)
+// - OPENFGA_DATASTORE_MAX_IDLE_CONNS (MaxIdleConns)  
 // - OPENFGA_DATASTORE_CONN_MAX_LIFETIME (ConnMaxLifetime)
 // - OPENFGA_DATASTORE_CONN_MAX_IDLE_TIME (ConnMaxIdleTime)
 //
@@ -52,11 +53,11 @@ func TestMySQLConnectionPoolMaxOpenConnections(t *testing.T) {
 	for i := 0; i < numOperations; i++ {
 		go func() {
 			defer wg.Done()
-
+			
 			// Create a context with timeout to prevent hanging
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-
+			
 			// Create a simple query that takes some time to ensure connections are held
 			rows, err := ds.db.QueryContext(ctx, "SELECT SLEEP(0.1)")
 			if err != nil {
@@ -64,7 +65,7 @@ func TestMySQLConnectionPoolMaxOpenConnections(t *testing.T) {
 				return
 			}
 			rows.Close()
-
+			
 			// Check connection stats
 			stats := ds.db.Stats()
 			maxObserved <- stats.OpenConnections
@@ -82,8 +83,8 @@ func TestMySQLConnectionPoolMaxOpenConnections(t *testing.T) {
 
 	// Verify that open connections never exceeded the configured limit
 	for observed := range maxObserved {
-		require.LessOrEqual(t, observed, maxOpenConns,
-			"Open connections (%d) exceeded max limit (%d)", observed, maxOpenConns)
+		require.LessOrEqual(t, observed, maxOpenConns, 
+			fmt.Sprintf("Open connections (%d) exceeded max limit (%d)", observed, maxOpenConns))
 	}
 
 	// Final stats check
@@ -107,7 +108,7 @@ func TestMySQLConnectionPoolMaxIdleConnections(t *testing.T) {
 	// Create several connections by running queries
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
+	
 	for i := 0; i < 3; i++ {
 		rows, err := ds.db.QueryContext(ctx, "SELECT 1")
 		require.NoError(t, err)
@@ -120,7 +121,7 @@ func TestMySQLConnectionPoolMaxIdleConnections(t *testing.T) {
 	// Check that idle connections don't exceed the limit
 	stats := ds.db.Stats()
 	require.LessOrEqual(t, stats.Idle, maxIdleConns,
-		"Idle connections (%d) exceeded max limit (%d)", stats.Idle, maxIdleConns)
+		fmt.Sprintf("Idle connections (%d) exceeded max limit (%d)", stats.Idle, maxIdleConns))
 }
 
 func TestMySQLConnectionPoolMaxLifetime(t *testing.T) {
@@ -140,7 +141,7 @@ func TestMySQLConnectionPoolMaxLifetime(t *testing.T) {
 	// Create some connections
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
+	
 	for i := 0; i < 2; i++ {
 		rows, err := ds.db.QueryContext(ctx, "SELECT 1")
 		require.NoError(t, err)
@@ -184,7 +185,7 @@ func TestMySQLConnectionPoolMaxIdleTime(t *testing.T) {
 	// Create some connections
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
+	
 	for i := 0; i < 2; i++ {
 		rows, err := ds.db.QueryContext(ctx, "SELECT 1")
 		require.NoError(t, err)
@@ -238,15 +239,15 @@ func TestMySQLConnectionPoolLifetimeLimits(t *testing.T) {
 	elapsed := time.Since(start)
 	require.Less(t, elapsed, maxLifetime, "Connection should be usable within max lifetime")
 
-	// Test that idle connections can live up to max idle time
+	// Test that idle connections can live up to max idle time  
 	start = time.Now()
 	rows, err = ds.db.QueryContext(ctx, "SELECT 1")
 	require.NoError(t, err)
 	rows.Close()
-
+	
 	// Wait less than max idle time
 	time.Sleep(maxIdleTime / 2)
-
+	
 	// Connection should still be usable
 	rows, err = ds.db.QueryContext(ctx, "SELECT 1")
 	require.NoError(t, err)
