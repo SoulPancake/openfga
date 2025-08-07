@@ -22,6 +22,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"time"
@@ -280,15 +281,16 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 	if opts.Pagination.PageSize > 0 {
 		findOptions.SetLimit(int64(opts.Pagination.PageSize + 1)) // +1 to check if there are more results
-	} else {
-		// If no page size specified, return all results
-		// Don't set a limit
 	}
 
 	if opts.Pagination.From != "" {
-		// Assuming continuation token is the MongoDB ObjectID of the last document
-		findOptions.SetSkip(1) // Skip the last document we've seen
-		filter["_id"] = bson.M{"$gt": opts.Pagination.From}
+		// Convert the continuation token back to ObjectID for comparison
+		if objectID, err := primitive.ObjectIDFromHex(opts.Pagination.From); err == nil {
+			filter["_id"] = bson.M{"$gt": objectID}
+		} else {
+			// Fallback to string comparison if not a valid ObjectID
+			filter["_id"] = bson.M{"$gt": opts.Pagination.From}
+		}
 	}
 
 	// Set sorting (assuming we sort by _id for continuation)
@@ -306,19 +308,24 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 	for cursor.Next(ctx) {
 		var doc struct {
-			ID               string `bson:"_id"`
-			Object           string `bson:"object"`
-			Relation         string `bson:"relation"`
-			User             string `bson:"user"`
-			ConditionName    string `bson:"condition_name,omitempty"`
-			ConditionContext []byte `bson:"condition_context,omitempty"`
+			ID               interface{} `bson:"_id"`  // MongoDB ObjectID can be various types
+			Object           string      `bson:"object"`
+			Relation         string      `bson:"relation"`
+			User             string      `bson:"user"`
+			ConditionName    string      `bson:"condition_name,omitempty"`
+			ConditionContext []byte      `bson:"condition_context,omitempty"`
 		}
 
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, "", fmt.Errorf("error decoding tuple: %w", err)
 		}
 
-		lastID = doc.ID
+		lastID = ""
+		if objID, ok := doc.ID.(primitive.ObjectID); ok {
+			lastID = objID.Hex()
+		} else {
+			lastID = fmt.Sprintf("%v", doc.ID)
+		}
 
 		tuple := &openfgav1.Tuple{
 			Key: &openfgav1.TupleKey{
