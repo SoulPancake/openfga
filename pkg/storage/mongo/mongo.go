@@ -22,6 +22,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"time"
@@ -65,83 +66,75 @@ func (d *Datastore) Write(ctx context.Context, store string, deletes storage.Del
 
 	coll := d.tuplesCollection
 
-	// Start a session and a transaction
-	session, err := d.client.StartSession()
-	if err != nil {
-		return fmt.Errorf("failed to start mongo session: %w", err)
+	// Process deletions first
+	if len(deletes) > 0 {
+		var deleteFilters []bson.M
+		for _, tk := range deletes {
+			filter := bson.M{
+				"store": store,
+			}
+
+			if tk.GetObject() != "" {
+				filter["object"] = tk.GetObject()
+			}
+
+			if tk.GetRelation() != "" {
+				filter["relation"] = tk.GetRelation()
+			}
+
+			if tk.GetUser() != "" {
+				filter["user"] = tk.GetUser()
+			}
+
+			deleteFilters = append(deleteFilters, filter)
+		}
+
+		if len(deleteFilters) > 0 {
+			// Use OR to combine filters
+			deleteOp := bson.M{"$or": deleteFilters}
+			_, err := coll.DeleteMany(ctx, deleteOp)
+			if err != nil {
+				return fmt.Errorf("failed to delete tuples: %w", err)
+			}
+		}
 	}
-	defer session.EndSession(ctx)
 
-	// Use WithTransaction to handle commit/abort logic
-	err = mongo.WithSession(ctx, session, func(sessionContext mongo.SessionContext) error {
-		if err := session.StartTransaction(); err != nil {
-			return fmt.Errorf("failed to start transaction: %w", err)
-		}
-
-		// Process deletions
-		if len(deletes) > 0 {
-			var deleteFilters []bson.M
-			for _, tk := range deletes {
-				filter := bson.M{
-					"store": store,
-				}
-
-				if tk.GetObject() != "" {
-					filter["object"] = tk.GetObject()
-				}
-
-				if tk.GetRelation() != "" {
-					filter["relation"] = tk.GetRelation()
-				}
-
-				if tk.GetUser() != "" {
-					filter["user"] = tk.GetUser()
-				}
-
-				deleteFilters = append(deleteFilters, filter)
+	// Process insertions
+	if len(wr) > 0 {
+		var documents []interface{}
+		for _, tupleKey := range wr {
+			if tupleKey == nil {
+				continue
 			}
 
-			if len(deleteFilters) > 0 {
-				// Use OR to combine filters
-				deleteOp := bson.M{"$or": deleteFilters}
-				_, err := coll.DeleteMany(sessionContext, deleteOp)
+			doc := bson.M{
+				"store":    store,
+				"object":   tupleKey.GetObject(),
+				"relation": tupleKey.GetRelation(),
+				"user":     tupleKey.GetUser(),
+			}
+
+			// Handle conditions
+			if tupleKey.GetCondition() != nil {
+				conditionName, conditionContext, err := sqlcommon.MarshalRelationshipCondition(tupleKey.GetCondition())
 				if err != nil {
-					return fmt.Errorf("failed to delete tuples: %w", err)
+					return fmt.Errorf("failed to marshal condition: %w", err)
+				}
+				doc["condition_name"] = conditionName
+				if conditionContext != nil {
+					doc["condition_context"] = conditionContext
 				}
 			}
+
+			documents = append(documents, doc)
 		}
 
-		// Process insertions
-		if len(wr) > 0 {
-			var documents []interface{}
-			for _, tupleKey := range wr {
-				if tupleKey == nil {
-					continue
-				}
-
-				doc := bson.M{
-					"store":    store,
-					"object":   tupleKey.GetObject(),
-					"relation": tupleKey.GetRelation(),
-					"user":     tupleKey.GetUser(),
-				}
-
-				documents = append(documents, doc)
-			}
-
-			if len(documents) > 0 {
-				_, err := coll.InsertMany(sessionContext, documents)
-				if err != nil {
-					return fmt.Errorf("failed to insert tuples: %w", err)
-				}
+		if len(documents) > 0 {
+			_, err := coll.InsertMany(ctx, documents)
+			if err != nil {
+				return fmt.Errorf("failed to insert tuples: %w", err)
 			}
 		}
-
-		return session.CommitTransaction(sessionContext)
-	})
-
-	if err != nil {
-		return fmt.Errorf("transaction failed: %w", err)
 	}
 
 	return nil
@@ -192,9 +185,11 @@ func newMongoTupleIterator(ctx context.Context, cursor *mongo.Cursor) storage.Tu
 func (it *mongoTupleIterator) Next(ctx context.Context) (*openfgav1.Tuple, error) {
 	if it.cursor.Next(ctx) {
 		var doc struct {
-			Object   string `bson:"object"`
-			Relation string `bson:"relation"`
-			User     string `bson:"user"`
+			Object           string `bson:"object"`
+			Relation         string `bson:"relation"`
+			User             string `bson:"user"`
+			ConditionName    string `bson:"condition_name,omitempty"`
+			ConditionContext []byte `bson:"condition_context,omitempty"`
 		}
 
 		if err := it.cursor.Decode(&doc); err != nil {
@@ -207,6 +202,26 @@ func (it *mongoTupleIterator) Next(ctx context.Context) (*openfgav1.Tuple, error
 				Relation: doc.Relation,
 				User:     doc.User,
 			},
+		}
+
+		// Handle conditions
+		if doc.ConditionName != "" {
+			condition := &openfgav1.RelationshipCondition{
+				Name: doc.ConditionName,
+			}
+
+			if doc.ConditionContext != nil {
+				var conditionContextStruct structpb.Struct
+				if err := proto.Unmarshal(doc.ConditionContext, &conditionContextStruct); err != nil {
+					return nil, fmt.Errorf("error unmarshalling condition context: %w", err)
+				}
+				condition.Context = &conditionContextStruct
+			} else {
+				// Set empty context if none provided
+				condition.Context = &structpb.Struct{}
+			}
+
+			tuple.Key.Condition = condition
 		}
 
 		it.lastTuple = tuple
@@ -269,9 +284,13 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 	}
 
 	if opts.Pagination.From != "" {
-		// Assuming continuation token is the MongoDB ObjectID of the last document
-		findOptions.SetSkip(1) // Skip the last document we've seen
-		filter["_id"] = bson.M{"$gt": opts.Pagination.From}
+		// Convert the continuation token back to ObjectID for comparison
+		if objectID, err := primitive.ObjectIDFromHex(opts.Pagination.From); err == nil {
+			filter["_id"] = bson.M{"$gt": objectID}
+		} else {
+			// Fallback to string comparison if not a valid ObjectID
+			filter["_id"] = bson.M{"$gt": opts.Pagination.From}
+		}
 	}
 
 	// Set sorting (assuming we sort by _id for continuation)
@@ -289,25 +308,54 @@ func (d *Datastore) ReadPage(ctx context.Context, store string, tupleKey *openfg
 
 	for cursor.Next(ctx) {
 		var doc struct {
-			ID       string `bson:"_id"`
-			Object   string `bson:"object"`
-			Relation string `bson:"relation"`
-			User     string `bson:"user"`
+			ID               interface{} `bson:"_id"`  // MongoDB ObjectID can be various types
+			Object           string      `bson:"object"`
+			Relation         string      `bson:"relation"`
+			User             string      `bson:"user"`
+			ConditionName    string      `bson:"condition_name,omitempty"`
+			ConditionContext []byte      `bson:"condition_context,omitempty"`
 		}
 
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, "", fmt.Errorf("error decoding tuple: %w", err)
 		}
 
-		lastID = doc.ID
+		lastID = ""
+		if objID, ok := doc.ID.(primitive.ObjectID); ok {
+			lastID = objID.Hex()
+		} else {
+			lastID = fmt.Sprintf("%v", doc.ID)
+		}
 
-		tuples = append(tuples, &openfgav1.Tuple{
+		tuple := &openfgav1.Tuple{
 			Key: &openfgav1.TupleKey{
 				Object:   doc.Object,
 				Relation: doc.Relation,
 				User:     doc.User,
 			},
-		})
+		}
+
+		// Handle conditions
+		if doc.ConditionName != "" {
+			condition := &openfgav1.RelationshipCondition{
+				Name: doc.ConditionName,
+			}
+
+			if doc.ConditionContext != nil {
+				var conditionContextStruct structpb.Struct
+				if err := proto.Unmarshal(doc.ConditionContext, &conditionContextStruct); err != nil {
+					return nil, "", fmt.Errorf("error unmarshalling condition context: %w", err)
+				}
+				condition.Context = &conditionContextStruct
+			} else {
+				// Set empty context if none provided
+				condition.Context = &structpb.Struct{}
+			}
+
+			tuple.Key.Condition = condition
+		}
+
+		tuples = append(tuples, tuple)
 	}
 
 	if err := cursor.Err(); err != nil {
@@ -343,9 +391,11 @@ func (d *Datastore) ReadUserTuple(ctx context.Context, store string, tupleKey *o
 	// Execute the query
 	coll := d.tuplesCollection
 	var result struct {
-		Object   string `bson:"object"`
-		Relation string `bson:"relation"`
-		User     string `bson:"user"`
+		Object           string `bson:"object"`
+		Relation         string `bson:"relation"`
+		User             string `bson:"user"`
+		ConditionName    string `bson:"condition_name,omitempty"`
+		ConditionContext []byte `bson:"condition_context,omitempty"`
 	}
 
 	err := coll.FindOne(ctx, filter).Decode(&result)
@@ -363,6 +413,26 @@ func (d *Datastore) ReadUserTuple(ctx context.Context, store string, tupleKey *o
 			Relation: result.Relation,
 			User:     result.User,
 		},
+	}
+
+	// Handle conditions
+	if result.ConditionName != "" {
+		condition := &openfgav1.RelationshipCondition{
+			Name: result.ConditionName,
+		}
+
+		if result.ConditionContext != nil {
+			var conditionContextStruct structpb.Struct
+			if err := proto.Unmarshal(result.ConditionContext, &conditionContextStruct); err != nil {
+				return nil, fmt.Errorf("error unmarshalling condition context: %w", err)
+			}
+			condition.Context = &conditionContextStruct
+		} else {
+			// Set empty context if none provided
+			condition.Context = &structpb.Struct{}
+		}
+
+		tuple.Key.Condition = condition
 	}
 
 	return tuple, nil
@@ -518,6 +588,11 @@ func (d *Datastore) ReadAuthorizationModel(ctx context.Context, store string, id
 		return nil, fmt.Errorf("error querying authorization model: %w", err)
 	}
 
+	// If model has zero types, return ErrNotFound
+	if len(result.TypeDefs) == 0 {
+		return nil, storage.ErrNotFound
+	}
+
 	return &openfgav1.AuthorizationModel{
 		Id:              result.ID,
 		TypeDefinitions: result.TypeDefs,
@@ -620,6 +695,12 @@ func (d *Datastore) WriteAuthorizationModel(ctx context.Context, store string, m
 	ctx, span := startTrace(ctx, "WriteAuthorizationModel")
 	defer span.End()
 
+	typeDefinitions := model.GetTypeDefinitions()
+
+	if len(typeDefinitions) < 1 {
+		return nil
+	}
+
 	coll := d.database.Collection("authorization_models")
 
 	doc := bson.M{
@@ -657,6 +738,15 @@ func (d *Datastore) CreateStore(ctx context.Context, store *openfgav1.Store) (*o
 		return nil, storage.ErrCollision
 	} else if !errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, fmt.Errorf("error checking store existence: %w", err)
+	}
+
+	// Check if store with same ID already exists
+	existingIDFilter := bson.M{"id": store.GetId()}
+	err = coll.FindOne(ctx, existingIDFilter).Decode(&existingStore)
+	if err == nil {
+		return nil, storage.ErrCollision
+	} else if !errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, fmt.Errorf("error checking store ID existence: %w", err)
 	}
 
 	// Prepare store document
